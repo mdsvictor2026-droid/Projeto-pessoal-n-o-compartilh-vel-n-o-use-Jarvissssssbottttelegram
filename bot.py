@@ -45,7 +45,7 @@ PROMPT_PATH = BASE_DIR / "core" / "prompt.txt"
 GEMINI_MODEL    = "gemini-2.5-flash"
 GEMINI_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-GROQ_MODEL    = "openai/gpt-oss-120b"
+GROQ_MODEL    = "llama-3.3-70b-versatile"
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # Sessões de conversa por usuário  {user_id: [messages]}  (formato OpenAI: role/content)
@@ -105,7 +105,7 @@ def _load_system_prompt() -> str:
             "You are running as a Telegram bot, so you cannot control the computer, "
             "open apps, or access the screen. Focus on: web search, weather, "
             "file analysis, answering questions, and memory. "
-            "Always call sir to user."
+            "Always call the user \"senhor\" instead of \"sir\"."
         )
 
 
@@ -450,14 +450,13 @@ def _call_llm(user_id: int, user_message: str) -> str:
     history.append({"role": "assistant", "content": final_text or "..."})
     _sessions[user_id] = history[-20:]
 
-    tag = "🟦 Raciocínio feito usando Gemini" if engine_used == "gemini" else "🟧 Raciocínio feito usando Groq"
-    return f"{final_text}\n\n_{tag}_"
+    return final_text
 
 
 # ── Handlers do Telegram ───────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    name = user.first_name or "Sir"
+    name = user.first_name or "Senhor"
     await update.message.reply_text(
         f"Welcome, {name}. I am JARVIS, at your service.\n\n"
         "You can talk to me normally. I can:\n"
@@ -475,7 +474,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     _sessions.pop(user_id, None)
     await update.message.reply_text(
-        "Conversation history cleared, sir. Starting fresh."
+        "Histórico de conversa limpo, senhor. Recomeçando do zero."
     )
 
 
@@ -484,7 +483,7 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     memory  = _memories.get(user_id) or load_memory()
     text    = format_memory_for_prompt(memory)
     if not text:
-        await update.message.reply_text("I have no stored memories about you yet, sir.")
+        await update.message.reply_text("Ainda não tenho memórias guardadas sobre o senhor.")
     else:
         lines = text.split("\n")
         clean = "\n".join(lines[1:]) if lines[0].startswith("[WHAT") else text
@@ -527,7 +526,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     except Exception as e:
         logger.error(f"Error handling message: {e}", exc_info=True)
-        reply = f"I'm sorry, sir. An error occurred: {e}"
+        reply = f"Desculpe, senhor. Ocorreu um erro: {e}"
 
     if len(reply) > 4096:
         for i in range(0, len(reply), 4096):
@@ -575,7 +574,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     except Exception as e:
         logger.error(f"Document error: {e}", exc_info=True)
-        reply = f"Sorry sir, I couldn't process the file: {e}"
+        reply = f"Desculpe, senhor, não consegui processar o arquivo: {e}"
 
     if len(reply) > 4096:
         for i in range(0, len(reply), 4096):
