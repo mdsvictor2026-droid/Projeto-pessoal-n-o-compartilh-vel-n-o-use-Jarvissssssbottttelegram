@@ -1,18 +1,17 @@
 """
 Mark XLVII — Telegram Bot
 Roda na nuvem do Railway. Converte o assistente JARVIS em um bot Telegram.
+Backend de LLM: Groq (llama-3.3-70b-versatile).
 """
 
-import asyncio
 import json
 import logging
 import os
-import sys
-import traceback
-from datetime import datetime
+import asyncio
 from pathlib import Path
 
-from telegram import Update, BotCommand
+import requests
+from telegram import Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
@@ -21,8 +20,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from google import genai
-from google.genai import types
 
 from memory.memory_manager import (
     load_memory,
@@ -30,7 +27,6 @@ from memory.memory_manager import (
     format_memory_for_prompt,
 )
 from actions.web_search import web_search as web_search_action
-from actions.weather_report import weather_action
 from actions.file_processor import file_processor
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -46,30 +42,31 @@ CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH = BASE_DIR / "core" / "prompt.txt"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TEXT_MODEL = "gemini-2.5-flash"
+GROQ_MODEL    = "llama-3.3-70b-versatile"
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
-# Sessões de conversa por usuário  {user_id: [messages]}
+# Sessões de conversa por usuário  {user_id: [messages]}  (formato OpenAI: role/content)
 _sessions: dict[int, list[dict]] = {}
 # Memória por usuário             {user_id: dict}
 _memories: dict[int, dict] = {}
 
 
-def _get_api_key() -> str:
-    """Pega a chave da API do Gemini — env var tem prioridade sobre config file."""
-    key = os.environ.get("GEMINI_API_KEY", "")
+def _get_groq_key() -> str:
+    """Pega a chave da API da Groq — env var tem prioridade sobre config file."""
+    key = os.environ.get("GROQ_API_KEY", "").strip()
     if key:
         return key
     try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["gemini_api_key"]
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["groq_api_key"]
     except Exception:
         raise RuntimeError(
-            "GEMINI_API_KEY não definida. "
-            "Configure a env var GEMINI_API_KEY no Railway."
+            "GROQ_API_KEY não definida. "
+            "Configure a env var GROQ_API_KEY no Railway."
         )
 
 
 def _get_telegram_token() -> str:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         try:
             token = json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get(
@@ -100,71 +97,83 @@ def _load_system_prompt() -> str:
         )
 
 
-# ── Tool declarations (apenas as que fazem sentido em cloud/Telegram) ─────────
-TOOL_DECLARATIONS = [
+# ── Tool declarations (formato OpenAI / Groq) ─────────────────────────────────
+TOOLS = [
     {
-        "name": "web_search",
-        "description": (
-            "Searches the web. Use for ANY question about current facts, events, prices, "
-            "or topics — always prefer this over guessing. "
-            "Modes: 'search' (default), 'news' (latest headlines on a topic), "
-            "'research' (deep comprehensive answer), 'price' (product cost lookup), "
-            "'compare' (side-by-side comparison of items)."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "query":  {"type": "STRING", "description": "Search query or topic. For compare, list items separated by comma."},
-                "mode":   {"type": "STRING", "description": "search | news | research | price | compare"},
-                "aspect": {"type": "STRING", "description": "Comparison aspect: price | specs | reviews | features"},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "weather_report",
-        "description": "Gets the weather report for a city using web search.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "city": {"type": "STRING", "description": "City name"},
-                "time": {"type": "STRING", "description": "When: today, tomorrow, this week"},
-            },
-            "required": ["city"],
-        },
-    },
-    {
-        "name": "save_memory",
-        "description": (
-            "Saves important information about the user to long-term memory. "
-            "Use this automatically when the user shares personal info, preferences, "
-            "or important context. Categories: identity, preferences, projects, "
-            "relationships, wishes, notes. "
-            "Values must be in English regardless of the conversation language."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "category": {
-                    "type": "STRING",
-                    "description": "identity | preferences | projects | relationships | wishes | notes",
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Searches the web. Use for ANY question about current facts, events, prices, "
+                "or topics — always prefer this over guessing. "
+                "Modes: 'search' (default), 'news' (latest headlines on a topic), "
+                "'research' (deep comprehensive answer), 'price' (product cost lookup), "
+                "'compare' (side-by-side comparison of items, list them comma-separated in query)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query":  {"type": "string", "description": "Search query or topic"},
+                    "mode":   {"type": "string", "description": "search | news | research | price | compare"},
+                    "aspect": {"type": "string", "description": "Comparison aspect: price | specs | reviews | features"},
                 },
-                "key":   {"type": "STRING", "description": "Memory key (snake_case)"},
-                "value": {"type": "STRING", "description": "Value to remember (in English)"},
+                "required": ["query"],
             },
-            "required": ["category", "key", "value"],
         },
     },
     {
-        "name": "forget_memory",
-        "description": "Deletes a specific memory entry when the user asks to forget something.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "category": {"type": "STRING", "description": "Memory category"},
-                "key":      {"type": "STRING", "description": "Key to forget"},
+        "type": "function",
+        "function": {
+            "name": "weather_report",
+            "description": "Gets the weather report for a city using web search.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "City name"},
+                    "time": {"type": "string", "description": "When: today, tomorrow, this week"},
+                },
+                "required": ["city"],
             },
-            "required": ["category", "key"],
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": (
+                "Saves important information about the user to long-term memory. "
+                "Use this automatically when the user shares personal info, preferences, "
+                "or important context. Categories: identity, preferences, projects, "
+                "relationships, wishes, notes. "
+                "Values must be in English regardless of the conversation language."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "identity | preferences | projects | relationships | wishes | notes",
+                    },
+                    "key":   {"type": "string", "description": "Memory key (snake_case)"},
+                    "value": {"type": "string", "description": "Value to remember (in English)"},
+                },
+                "required": ["category", "key", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_memory",
+            "description": "Deletes a specific memory entry when the user asks to forget something.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "description": "Memory category"},
+                    "key":      {"type": "string", "description": "Key to forget"},
+                },
+                "required": ["category", "key"],
+            },
         },
     },
 ]
@@ -178,7 +187,6 @@ def _execute_tool(name: str, args: dict, user_id: int) -> str:
             return web_search_action(parameters=args)
 
         if name == "weather_report":
-            # weather_action abre browser — aqui usamos web_search no lugar
             city = args.get("city", "")
             when = args.get("time", "today")
             return web_search_action(
@@ -210,14 +218,17 @@ def _execute_tool(name: str, args: dict, user_id: int) -> str:
         return f"Tool {name} failed: {e}"
 
 
-# ── Gemini call com tool loop ──────────────────────────────────────────────────
-def _call_gemini(user_id: int, user_message: str) -> str:
+# ── Groq call com tool loop ────────────────────────────────────────────────────
+def _call_groq(user_id: int, user_message: str) -> str:
     """
-    Chama o Gemini com histórico da conversa + memória + tools.
+    Chama a Groq (formato OpenAI) com histórico da conversa + memória + tools.
     Retorna a resposta final em texto.
     """
-    api_key = _get_api_key()
-    client  = genai.Client(api_key=api_key)
+    api_key = _get_groq_key()
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type":  "application/json",
+    }
 
     # Carrega memória do usuário
     memory = _memories.get(user_id) or load_memory()
@@ -225,104 +236,63 @@ def _call_gemini(user_id: int, user_message: str) -> str:
     memory_text = format_memory_for_prompt(memory)
 
     # Monta system prompt
-    base_prompt = _load_system_prompt()
-    system_prompt = base_prompt
-    if memory_text:
-        system_prompt = base_prompt + "\n\n" + memory_text
+    base_prompt   = _load_system_prompt()
+    system_prompt = base_prompt + ("\n\n" + memory_text if memory_text else "")
 
-    # Histórico de conversa do usuário
+    # Histórico de conversa do usuário (formato OpenAI: {"role", "content"})
     history = _sessions.get(user_id, [])
-    history.append({"role": "user", "parts": [{"text": user_message}]})
+    history.append({"role": "user", "content": user_message})
 
-    # Converte tools para o formato do Gemini
-    gemini_tools = []
-    for td in TOOL_DECLARATIONS:
-        props = {}
-        for pname, pdata in td["parameters"]["properties"].items():
-            ptype = pdata["type"].lower()
-            # Gemini só aceita: string, number, integer, boolean, object
-            if ptype in ("array", "object"):
-                ptype = "string"
-            props[pname] = {
-                "type":        ptype,
-                "description": pdata.get("description", ""),
-            }
-        gemini_tools.append({
-            "name":        td["name"],
-            "description": td["description"],
-            "parameters": {
-                "type":       "object",
-                "properties": props,
-                "required":   td["parameters"].get("required", []),
-            },
-        })
-
-    config = types.GenerateContentConfig(
-        system_instruction=system_prompt,
-        tools=[types.Tool(function_declarations=gemini_tools)],
-        temperature=0.7,
-    )
-
-    # Tool loop (máximo 5 rodadas)
-    contents = [
-        types.Content(
-            role=turn["role"],
-            parts=[types.Part(text=p["text"]) for p in turn["parts"] if "text" in p],
-        )
-        for turn in history
-    ]
+    messages = [{"role": "system", "content": system_prompt}] + history
 
     final_text = ""
-    for _ in range(5):
-        response = client.models.generate_content(
-            model=TEXT_MODEL,
-            contents=contents,
-            config=config,
-        )
+    for _ in range(5):  # tool loop, máximo 5 rodadas
+        payload = {
+            "model":       GROQ_MODEL,
+            "messages":    messages,
+            "tools":       TOOLS,
+            "tool_choice": "auto",
+            "temperature": 0.7,
+            "max_tokens":  1024,
+        }
 
-        candidate = response.candidates[0]
-        parts      = candidate.content.parts
+        resp = requests.post(GROQ_ENDPOINT, headers=headers, json=payload, timeout=60)
 
-        # Coleta texto e tool calls
-        text_parts     = []
-        function_calls = []
+        if resp.status_code != 200:
+            logger.error(f"Groq error {resp.status_code}: {resp.text[:500]}")
+            resp.raise_for_status()
 
-        for part in parts:
-            if hasattr(part, "text") and part.text:
-                text_parts.append(part.text)
-            if hasattr(part, "function_call") and part.function_call:
-                function_calls.append(part.function_call)
+        data    = resp.json()
+        choice  = data["choices"][0]
+        msg     = choice["message"]
+        tool_calls = msg.get("tool_calls") or []
 
-        # Adiciona resposta do modelo ao histórico
-        contents.append(types.Content(role="model", parts=parts))
+        # Adiciona a resposta do modelo ao histórico de mensagens da requisição
+        messages.append(msg)
 
-        if not function_calls:
-            # Sem tool calls — resposta final
-            final_text = " ".join(text_parts).strip()
+        if not tool_calls:
+            final_text = (msg.get("content") or "").strip()
             break
 
-        # Executa tools e injeta resultados
-        tool_result_parts = []
-        for fc in function_calls:
-            args   = dict(fc.args) if fc.args else {}
-            result = _execute_tool(fc.name, args, user_id)
-            logger.info(f"[Tool] {fc.name}({args}) → {result[:80]}…")
-            tool_result_parts.append(
-                types.Part(
-                    function_response=types.FunctionResponse(
-                        name=fc.name,
-                        response={"result": result},
-                    )
-                )
-            )
+        # Executa cada tool chamada e injeta o resultado
+        for tc in tool_calls:
+            fn_name = tc["function"]["name"]
+            try:
+                fn_args = json.loads(tc["function"].get("arguments") or "{}")
+            except json.JSONDecodeError:
+                fn_args = {}
 
-        contents.append(
-            types.Content(role="user", parts=tool_result_parts)
-        )
+            result = _execute_tool(fn_name, fn_args, user_id)
+            logger.info(f"[Tool] {fn_name}({fn_args}) → {str(result)[:80]}…")
 
-    # Salva histórico (últimas 20 mensagens)
-    model_reply_parts = [{"text": final_text}] if final_text else [{"text": "..."}]
-    history.append({"role": "model", "parts": model_reply_parts})
+            messages.append({
+                "role":         "tool",
+                "tool_call_id": tc["id"],
+                "content":      str(result),
+            })
+
+    # Salva histórico real da conversa (sem o system prompt, últimas 20 mensagens)
+    history.append({"role": "assistant", "content": final_text or "..."})
     _sessions[user_id] = history[-20:]
 
     return final_text or "I'm sorry, sir. I could not generate a response."
@@ -360,7 +330,6 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not text:
         await update.message.reply_text("I have no stored memories about you yet, sir.")
     else:
-        # Remove o header de instrução interna
         lines = text.split("\n")
         clean = "\n".join(lines[1:]) if lines[0].startswith("[WHAT") else text
         await update.message.reply_text(
@@ -389,7 +358,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not text:
         return
 
-    # Mostra "digitando..."
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id,
         action=ChatAction.TYPING,
@@ -397,13 +365,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         reply = await asyncio.get_event_loop().run_in_executor(
-            None, _call_gemini, user_id, text
+            None, _call_groq, user_id, text
         )
     except Exception as e:
         logger.error(f"Error handling message: {e}", exc_info=True)
         reply = f"I'm sorry, sir. An error occurred: {e}"
 
-    # Telegram tem limite de 4096 chars por mensagem
     if len(reply) > 4096:
         for i in range(0, len(reply), 4096):
             await update.message.reply_text(reply[i : i + 4096])
@@ -423,16 +390,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
     try:
-        # Baixa o arquivo para um temp dir
         import tempfile
-        file = await doc.get_file()
+        file   = await doc.get_file()
         suffix = Path(doc.file_name or "file").suffix or ".bin"
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             await file.download_to_drive(tmp.name)
             tmp_path = tmp.name
 
-        # Chama o file_processor
         result = file_processor(
             parameters={
                 "action":      "auto",
@@ -441,19 +406,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             }
         )
 
-        # Limpa o arquivo temp
         Path(tmp_path).unlink(missing_ok=True)
 
-        # Injeta resultado no histórico como se o JARVIS tivesse visto
         history = _sessions.get(user_id, [])
-        history.append({
-            "role":  "user",
-            "parts": [{"text": f"[File: {doc.file_name}]\n{caption}"}],
-        })
-        history.append({
-            "role":  "model",
-            "parts": [{"text": result}],
-        })
+        history.append({"role": "user", "content": f"[File: {doc.file_name}]\n{caption}"})
+        history.append({"role": "assistant", "content": result})
         _sessions[user_id] = history[-20:]
 
         reply = result
@@ -475,19 +432,15 @@ def main() -> None:
 
     app = Application.builder().token(token).build()
 
-    # Comandos
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("reset",  cmd_reset))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("help",   cmd_help))
 
-    # Mensagens de texto
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Arquivos / documentos
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    logger.info("Mark XLVII Telegram Bot starting (polling mode)...")
+    logger.info("Mark XLVII Telegram Bot starting (polling mode, Groq backend)...")
     app.run_polling(drop_pending_updates=True)
 
 

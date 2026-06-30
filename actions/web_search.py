@@ -19,24 +19,9 @@ def _get_api_key() -> str:
 
 
 def _gemini_search(query: str) -> str:
-    from google import genai
-
-    client   = genai.Client(api_key=_get_api_key())
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=query,
-        config={"tools": [{"google_search": {}}]},
-    )
-
-    text = ""
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "text") and part.text:
-            text += part.text
-
-    text = text.strip()
-    if not text:
-        raise ValueError("Gemini returned an empty response.")
-    return text
+    # Gemini removido neste deploy (usamos Groq como LLM principal).
+    # Levanta erro de propósito para sempre cair no fallback DuckDuckGo abaixo.
+    raise RuntimeError("Gemini search disabled — using DuckDuckGo fallback.")
 
 
 def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
