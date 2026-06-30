@@ -1,0 +1,12 @@
+google-genai
+google-generativeai
+python-telegram-bot[webhooks]>=21.0
+requests
+beautifulsoup4
+duckduckgo-search
+Pillow
+numpy
+psutil
+python-pptx
+send2trash
+youtube-transcript-api
