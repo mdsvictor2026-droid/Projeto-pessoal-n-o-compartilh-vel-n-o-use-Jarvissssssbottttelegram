@@ -114,9 +114,8 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "query":  {"type": "STRING", "description": "Search query or topic"},
+                "query":  {"type": "STRING", "description": "Search query or topic. For compare, list items separated by comma."},
                 "mode":   {"type": "STRING", "description": "search | news | research | price | compare"},
-                "items":  {"type": "ARRAY",  "items": {"type": "STRING"}, "description": "Items to compare (compare mode)"},
                 "aspect": {"type": "STRING", "description": "Comparison aspect: price | specs | reviews | features"},
             },
             "required": ["query"],
@@ -238,11 +237,11 @@ def _call_gemini(user_id: int, user_message: str) -> str:
     # Converte tools para o formato do Gemini
     gemini_tools = []
     for td in TOOL_DECLARATIONS:
-        # Converte de OBJECT/STRING para o formato Function Declaration do Gemini
         props = {}
         for pname, pdata in td["parameters"]["properties"].items():
             ptype = pdata["type"].lower()
-            if ptype == "object":
+            # Gemini só aceita: string, number, integer, boolean, object
+            if ptype in ("array", "object"):
                 ptype = "string"
             props[pname] = {
                 "type":        ptype,
