@@ -45,7 +45,7 @@ PROMPT_PATH = BASE_DIR / "core" / "prompt.txt"
 GEMINI_MODEL    = "gemini-2.5-flash"
 GEMINI_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-GROQ_MODEL    = "llama-3.3-70b-versatile"
+GROQ_MODEL    = "openai/gpt-oss-120b"
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
 # Sessões de conversa por usuário  {user_id: [messages]}  (formato OpenAI: role/content)
