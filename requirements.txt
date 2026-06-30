@@ -8,3 +8,4 @@ psutil
 python-pptx
 send2trash
 youtube-transcript-api
+google-genai
