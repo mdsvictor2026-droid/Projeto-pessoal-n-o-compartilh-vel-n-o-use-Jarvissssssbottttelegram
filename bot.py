@@ -1,7 +1,7 @@
 """
 Mark XLVII — Telegram Bot
 Roda na nuvem do Railway. Converte o assistente JARVIS em um bot Telegram.
-Backend de LLM: Groq (llama-3.3-70b-versatile).
+Backend de LLM: tenta Gemini primeiro, cai para Groq automaticamente em caso de erro.
 """
 
 import json
@@ -42,6 +42,9 @@ CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH = BASE_DIR / "core" / "prompt.txt"
 
 # ── Config ────────────────────────────────────────────────────────────────────
+GEMINI_MODEL    = "gemini-2.5-flash"
+GEMINI_ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
 GROQ_MODEL    = "llama-3.3-70b-versatile"
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -51,8 +54,17 @@ _sessions: dict[int, list[dict]] = {}
 _memories: dict[int, dict] = {}
 
 
+def _get_gemini_key() -> str:
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["gemini_api_key"]
+    except Exception:
+        return ""
+
+
 def _get_groq_key() -> str:
-    """Pega a chave da API da Groq — env var tem prioridade sobre config file."""
     key = os.environ.get("GROQ_API_KEY", "").strip()
     if key:
         return key
@@ -97,8 +109,8 @@ def _load_system_prompt() -> str:
         )
 
 
-# ── Tool declarations (formato OpenAI / Groq) ─────────────────────────────────
-TOOLS = [
+# ── Tool declarations (formato OpenAI — compatível com Groq e usado também p/ Gemini) ──
+TOOLS_OPENAI = [
     {
         "type": "function",
         "function": {
@@ -179,6 +191,32 @@ TOOLS = [
 ]
 
 
+def _openai_tools_to_gemini(tools: list) -> list:
+    """Converte declarações de tool no formato OpenAI para o formato esperado pela API REST do Gemini."""
+    fn_decls = []
+    for t in tools:
+        fn = t["function"]
+        props = {}
+        for pname, pdata in fn["parameters"]["properties"].items():
+            ptype = pdata["type"].lower()
+            if ptype in ("array", "object"):
+                ptype = "string"
+            props[pname] = {
+                "type":        ptype.upper(),
+                "description": pdata.get("description", ""),
+            }
+        fn_decls.append({
+            "name":        fn["name"],
+            "description": fn["description"],
+            "parameters": {
+                "type":       "OBJECT",
+                "properties": props,
+                "required":   fn["parameters"].get("required", []),
+            },
+        })
+    return fn_decls
+
+
 # ── Tool executor ─────────────────────────────────────────────────────────────
 def _execute_tool(name: str, args: dict, user_id: int) -> str:
     """Executa uma tool e retorna o resultado como string."""
@@ -218,11 +256,12 @@ def _execute_tool(name: str, args: dict, user_id: int) -> str:
         return f"Tool {name} failed: {e}"
 
 
-# ── Groq call com tool loop ────────────────────────────────────────────────────
-def _call_groq(user_id: int, user_message: str) -> str:
+# ── Backend: Groq (formato OpenAI) ─────────────────────────────────────────────
+def _run_groq(messages: list, user_id: int) -> str:
     """
-    Chama a Groq (formato OpenAI) com histórico da conversa + memória + tools.
-    Retorna a resposta final em texto.
+    Roda o tool loop completo usando a Groq.
+    `messages` já vem no formato OpenAI (incluindo system prompt).
+    Levanta exceção se a chamada falhar.
     """
     api_key = _get_groq_key()
     headers = {
@@ -230,72 +269,189 @@ def _call_groq(user_id: int, user_message: str) -> str:
         "Content-Type":  "application/json",
     }
 
-    # Carrega memória do usuário
-    memory = _memories.get(user_id) or load_memory()
-    _memories[user_id] = memory
-    memory_text = format_memory_for_prompt(memory)
-
-    # Monta system prompt
-    base_prompt   = _load_system_prompt()
-    system_prompt = base_prompt + ("\n\n" + memory_text if memory_text else "")
-
-    # Histórico de conversa do usuário (formato OpenAI: {"role", "content"})
-    history = _sessions.get(user_id, [])
-    history.append({"role": "user", "content": user_message})
-
-    messages = [{"role": "system", "content": system_prompt}] + history
-
+    msgs = list(messages)  # cópia local, não polui o histórico do chamador
     final_text = ""
-    for _ in range(5):  # tool loop, máximo 5 rodadas
+
+    for _ in range(5):
         payload = {
             "model":       GROQ_MODEL,
-            "messages":    messages,
-            "tools":       TOOLS,
+            "messages":    msgs,
+            "tools":       TOOLS_OPENAI,
             "tool_choice": "auto",
             "temperature": 0.7,
             "max_tokens":  1024,
         }
-
         resp = requests.post(GROQ_ENDPOINT, headers=headers, json=payload, timeout=60)
-
         if resp.status_code != 200:
-            logger.error(f"Groq error {resp.status_code}: {resp.text[:500]}")
-            resp.raise_for_status()
+            raise RuntimeError(f"Groq HTTP {resp.status_code}: {resp.text[:300]}")
 
-        data    = resp.json()
-        choice  = data["choices"][0]
-        msg     = choice["message"]
+        data       = resp.json()
+        msg        = data["choices"][0]["message"]
         tool_calls = msg.get("tool_calls") or []
-
-        # Adiciona a resposta do modelo ao histórico de mensagens da requisição
-        messages.append(msg)
+        msgs.append(msg)
 
         if not tool_calls:
             final_text = (msg.get("content") or "").strip()
             break
 
-        # Executa cada tool chamada e injeta o resultado
         for tc in tool_calls:
             fn_name = tc["function"]["name"]
             try:
                 fn_args = json.loads(tc["function"].get("arguments") or "{}")
             except json.JSONDecodeError:
                 fn_args = {}
-
             result = _execute_tool(fn_name, fn_args, user_id)
-            logger.info(f"[Tool] {fn_name}({fn_args}) → {str(result)[:80]}…")
-
-            messages.append({
+            logger.info(f"[Tool/Groq] {fn_name}({fn_args}) → {str(result)[:80]}…")
+            msgs.append({
                 "role":         "tool",
                 "tool_call_id": tc["id"],
                 "content":      str(result),
             })
 
-    # Salva histórico real da conversa (sem o system prompt, últimas 20 mensagens)
+    if not final_text:
+        raise RuntimeError("Groq returned empty response after tool loop.")
+    return final_text
+
+
+# ── Backend: Gemini (REST API) ─────────────────────────────────────────────────
+def _openai_messages_to_gemini_contents(messages: list) -> tuple[str, list]:
+    """
+    Separa o system prompt e converte o resto do histórico (formato OpenAI)
+    para o formato 'contents' da API REST do Gemini.
+    """
+    system_text = ""
+    contents = []
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            system_text = m.get("content", "")
+            continue
+        if role == "user":
+            contents.append({"role": "user", "parts": [{"text": m.get("content", "")}]})
+        elif role == "assistant":
+            content = m.get("content") or ""
+            contents.append({"role": "model", "parts": [{"text": content}]})
+        elif role == "tool":
+            # Gemini espera functionResponse — aqui simplificamos como texto de usuário
+            contents.append({
+                "role": "user",
+                "parts": [{"text": f"[Tool result] {m.get('content', '')}"}],
+            })
+    return system_text, contents
+
+
+def _run_gemini(messages: list, user_id: int) -> str:
+    """
+    Roda o tool loop completo usando o Gemini (REST API direta, sem SDK).
+    Levanta exceção se a chamada falhar (key inválida, API desativada, quota etc).
+    """
+    api_key = _get_gemini_key()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not configured.")
+
+    system_text, base_contents = _openai_messages_to_gemini_contents(messages)
+    gemini_tools = _openai_tools_to_gemini(TOOLS_OPENAI)
+
+    contents = list(base_contents)
+    final_text = ""
+
+    for _ in range(5):
+        payload = {
+            "system_instruction": {"parts": [{"text": system_text}]},
+            "contents": contents,
+            "tools": [{"function_declarations": gemini_tools}],
+            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
+        }
+        resp = requests.post(
+            f"{GEMINI_ENDPOINT}?key={api_key}",
+            json=payload,
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Gemini HTTP {resp.status_code}: {resp.text[:300]}")
+
+        data = resp.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise RuntimeError(f"Gemini returned no candidates: {data}")
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text_parts     = []
+        function_calls = []
+        for p in parts:
+            if "text" in p and p["text"]:
+                text_parts.append(p["text"])
+            if "functionCall" in p:
+                function_calls.append(p["functionCall"])
+
+        contents.append({"role": "model", "parts": parts})
+
+        if not function_calls:
+            final_text = " ".join(text_parts).strip()
+            break
+
+        function_response_parts = []
+        for fc in function_calls:
+            fn_name = fc.get("name", "")
+            fn_args = fc.get("args", {}) or {}
+            result  = _execute_tool(fn_name, fn_args, user_id)
+            logger.info(f"[Tool/Gemini] {fn_name}({fn_args}) → {str(result)[:80]}…")
+            function_response_parts.append({
+                "functionResponse": {
+                    "name": fn_name,
+                    "response": {"result": str(result)},
+                }
+            })
+        contents.append({"role": "user", "parts": function_response_parts})
+
+    if not final_text:
+        raise RuntimeError("Gemini returned empty response after tool loop.")
+    return final_text
+
+
+# ── Orquestrador: tenta Gemini, cai para Groq ──────────────────────────────────
+def _call_llm(user_id: int, user_message: str) -> str:
+    """
+    Tenta Gemini primeiro. Se falhar por QUALQUER motivo (key inválida, API
+    desativada, quota excedida, timeout, etc), cai automaticamente para Groq.
+    Retorna o texto final já com a etiqueta do motor usado.
+    """
+    memory = _memories.get(user_id) or load_memory()
+    _memories[user_id] = memory
+    memory_text = format_memory_for_prompt(memory)
+
+    base_prompt   = _load_system_prompt()
+    system_prompt = base_prompt + ("\n\n" + memory_text if memory_text else "")
+
+    history = _sessions.get(user_id, [])
+    history.append({"role": "user", "content": user_message})
+
+    messages = [{"role": "system", "content": system_prompt}] + history
+
+    engine_used = None
+    final_text  = ""
+
+    # 1) Tenta Gemini
+    try:
+        final_text  = _run_gemini(messages, user_id)
+        engine_used = "gemini"
+    except Exception as e:
+        logger.warning(f"[LLM] Gemini failed, falling back to Groq: {e}")
+
+        # 2) Cai para Groq
+        try:
+            final_text  = _run_groq(messages, user_id)
+            engine_used = "groq"
+        except Exception as e2:
+            logger.error(f"[LLM] Groq also failed: {e2}", exc_info=True)
+            raise RuntimeError(f"Both Gemini and Groq failed. Last error: {e2}")
+
+    # Salva histórico real da conversa (sem system prompt, últimas 20 mensagens)
     history.append({"role": "assistant", "content": final_text or "..."})
     _sessions[user_id] = history[-20:]
 
-    return final_text or "I'm sorry, sir. I could not generate a response."
+    tag = "🟦 Raciocínio feito usando Gemini" if engine_used == "gemini" else "🟧 Raciocínio feito usando Groq"
+    return f"{final_text}\n\n_{tag}_"
 
 
 # ── Handlers do Telegram ───────────────────────────────────────────────────────
@@ -346,7 +502,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/reset — Clear conversation history\n"
         "/memory — Show what I remember about you\n"
         "/help — This message\n\n"
-        "You can also send me *files/documents* and ask me to analyze them.",
+        "You can also send me *files/documents* and ask me to analyze them.\n\n"
+        "I try Gemini first for every reply, and automatically fall back to Groq "
+        "if Gemini is unavailable. I'll always tell you which engine answered.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -365,7 +523,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         reply = await asyncio.get_event_loop().run_in_executor(
-            None, _call_groq, user_id, text
+            None, _call_llm, user_id, text
         )
     except Exception as e:
         logger.error(f"Error handling message: {e}", exc_info=True)
@@ -373,9 +531,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if len(reply) > 4096:
         for i in range(0, len(reply), 4096):
-            await update.message.reply_text(reply[i : i + 4096])
+            await update.message.reply_text(reply[i : i + 4096], parse_mode=ParseMode.MARKDOWN)
     else:
-        await update.message.reply_text(reply)
+        await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -440,7 +598,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    logger.info("Mark XLVII Telegram Bot starting (polling mode, Groq backend)...")
+    logger.info("Mark XLVII Telegram Bot starting (polling mode, Gemini→Groq fallback)...")
     app.run_polling(drop_pending_updates=True)
 
 
