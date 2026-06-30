@@ -488,25 +488,8 @@ def main() -> None:
     # Arquivos / documentos
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    logger.info("Mark XLVII Telegram Bot starting...")
-
-    # Railway usa PORT env var para health checks — webhook ou polling
-    webhook_url = os.environ.get("WEBHOOK_URL", "")
-    port        = int(os.environ.get("PORT", 8080))
-
-    if webhook_url:
-        # Modo webhook (recomendado no Railway)
-        logger.info(f"Starting webhook on port {port} at {webhook_url}")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=token,
-            webhook_url=f"{webhook_url}/{token}",
-        )
-    else:
-        # Modo polling (para testes locais)
-        logger.info("Starting polling mode (local dev)...")
-        app.run_polling(drop_pending_updates=True)
+    logger.info("Mark XLVII Telegram Bot starting (polling mode)...")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
